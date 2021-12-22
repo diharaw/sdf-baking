@@ -30,3 +30,13 @@
 *.exe
 *.out
 *.app
+
+external/
+external/*
+external/dwSampleFramwork
+bin/
+bin/*
+build/
+build/*
+lib/
+lib/*
