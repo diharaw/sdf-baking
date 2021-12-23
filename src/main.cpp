@@ -199,7 +199,7 @@ protected:
         settings.width                 = 1920;
         settings.height                = 1080;
         settings.title                 = "SDF Shadows (c) 2021 Dihara Wijetunga";
-        settings.enable_debug_callback = false;
+        settings.enable_debug_callback = true;
 
         return settings;
     }
@@ -238,9 +238,9 @@ private:
     bool create_uniform_buffer()
     {
         // Create uniform buffer for global data
-        m_global_ubo   = dw::gl::UniformBuffer::create(GL_DYNAMIC_DRAW, sizeof(GlobalUniforms));
-        m_instance_ubo = dw::gl::UniformBuffer::create(GL_DYNAMIC_DRAW, sizeof(InstanceUniforms) * NUM_INSTANCES);
-        m_sdf_ubo      = dw::gl::UniformBuffer::create(GL_DYNAMIC_DRAW, sizeof(uint64_t) * NUM_SDFS * 2);
+        m_global_ubo   = dw::gl::Buffer::create(GL_UNIFORM_BUFFER, GL_MAP_WRITE_BIT, sizeof(GlobalUniforms));
+        m_instance_ubo = dw::gl::Buffer::create(GL_UNIFORM_BUFFER, GL_MAP_WRITE_BIT, sizeof(InstanceUniforms) * NUM_INSTANCES);
+        m_sdf_ubo      = dw::gl::Buffer::create(GL_UNIFORM_BUFFER, GL_MAP_WRITE_BIT, sizeof(uint64_t) * NUM_SDFS * 2);
 
         return true;
     }
@@ -273,7 +273,12 @@ private:
         instance.sdf = dw::gl::Texture3D::create(instance.dimensions.x, instance.dimensions.y, instance.dimensions.z, 1, GL_R32F, GL_RED, GL_FLOAT);
         instance.sdf->set_min_filter(GL_LINEAR);
         instance.sdf->set_mag_filter(GL_LINEAR);
-        instance.sdf->set_data(0, data.data());
+        instance.sdf->set_wrapping(GL_CLAMP_TO_EDGE, GL_CLAMP_TO_EDGE, GL_CLAMP_TO_EDGE);
+
+        size_t xy_slice_size = instance.dimensions.x * instance.dimensions.y;
+
+        for (int z = 0; z < instance.dimensions.z; z++)
+            instance.sdf->write_data(z, 0, data.data() + xy_slice_size * z);
 
         return true;
     }
@@ -499,9 +504,9 @@ private:
     dw::gl::Shader::Ptr        m_mesh_fs;
     dw::gl::Shader::Ptr        m_mesh_vs;
     dw::gl::Program::Ptr       m_mesh_program;
-    dw::gl::UniformBuffer::Ptr m_global_ubo;
-    dw::gl::UniformBuffer::Ptr m_instance_ubo;
-    dw::gl::UniformBuffer::Ptr m_sdf_ubo;
+    dw::gl::Buffer::Ptr m_global_ubo;
+    dw::gl::Buffer::Ptr m_instance_ubo;
+    dw::gl::Buffer::Ptr m_sdf_ubo;
 
     std::vector<Instance>       m_instances;
     dw::Mesh::Ptr               m_ground;
