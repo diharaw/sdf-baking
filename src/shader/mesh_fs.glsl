@@ -42,6 +42,7 @@ layout(std140, binding = 0) uniform GlobalUniforms
 {
     mat4 view_proj;
     vec4 cam_pos;
+    vec4 light_direction;
     int  num_instances;
 };
 
@@ -141,7 +142,7 @@ float shadow_ray_march(vec3 ro, vec3 rd, float k)
 void main()
 {
     vec3 albedo = vec3(0.5f);
-    vec3 L      = normalize(-vec3(1.0f, -1.0f, 0.0f));
+    vec3 L      = -light_direction.xyz;
     vec3 N      = normalize(FS_IN_Normal);
 
     float shadow = shadow_ray_march(FS_IN_WorldPos, L, u_SDFSoftShadowsK);

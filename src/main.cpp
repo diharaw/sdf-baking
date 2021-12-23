@@ -23,6 +23,8 @@ struct GlobalUniforms
     DW_ALIGNED(16)
     glm::vec4 cam_pos;
     DW_ALIGNED(16)
+    glm::vec4 light_direction;
+    DW_ALIGNED(16)
     int32_t num_instances;
 };
 
@@ -38,13 +40,20 @@ struct InstanceUniforms
 
 struct Instance
 {
-    dw::Mesh::Ptr          mesh;
+    // Mesh
+    dw::Mesh::Ptr mesh;
+
+    // SDF
     dw::gl::Texture3D::Ptr sdf;
-    glm::ivec3             dimensions;
-    glm::vec3              origin;
-    float                  grid_spacing;
-    glm::vec3              position  = glm::vec3(0.0f);
-    glm::mat4              transform = glm::mat4(1.0f);
+    glm::ivec3             volume_size;
+    glm::vec3              grid_origin;
+    float                  grid_step_size;
+    glm::vec3              min_extents;
+    glm::vec3              max_extents;
+
+    // Transform
+    glm::vec3 position  = glm::vec3(0.0f);
+    glm::mat4 transform = glm::mat4(1.0f);
 };
 
 class SDFShadows : public dw::Application
@@ -92,7 +101,7 @@ protected:
         if (m_draw_bounding_boxes)
         {
             for (const auto& instance : m_instances)
-                m_debug_draw.obb(instance.mesh->min_extents(), instance.mesh->max_extents(), instance.transform, glm::vec3(1.0f, 0.0f, 0.0f));
+                m_debug_draw.obb(instance.min_extents, instance.max_extents, instance.transform, glm::vec3(1.0f, 0.0f, 0.0f));
         }
 
         m_debug_draw.render(nullptr, m_width, m_height, m_main_camera->m_view_projection, m_main_camera->m_position);
@@ -106,7 +115,8 @@ protected:
         ImGui::Checkbox("Soft Shadows", &m_soft_shadows);
         ImGui::InputFloat("T-Min", &m_t_min);
         ImGui::InputFloat("T-Max", &m_t_max);
-        ImGui::InputFloat("Soft Shadows K", &m_soft_shadows_k);
+        ImGui::SliderFloat("Soft Shadows K", &m_soft_shadows_k, 1.0f, 16.0f);
+        ImGui::SliderFloat("Light Pitch", &m_light_pitch, -1.0f, 1.0f);
 
         ImGui::Separator();
 
@@ -114,9 +124,11 @@ protected:
         {
             auto& instance = m_instances[i];
 
+            ImGui::PushID(i);
             ImGui::Text("Mesh %i", i);
             ImGui::InputFloat3("Position", &instance.position.x);
             ImGui::Separator();
+            ImGui::PopID();
         }
     }
 
@@ -199,7 +211,7 @@ protected:
         settings.width                 = 1920;
         settings.height                = 1080;
         settings.title                 = "SDF Shadows (c) 2021 Dihara Wijetunga";
-        settings.enable_debug_callback = true;
+        settings.enable_debug_callback = false;
 
         return settings;
     }
@@ -212,10 +224,11 @@ private:
     bool create_shaders()
     {
         // Create general shaders
-        m_mesh_vs = dw::gl::Shader::create_from_file(GL_VERTEX_SHADER, "shader/mesh_vs.glsl");
-        m_mesh_fs = dw::gl::Shader::create_from_file(GL_FRAGMENT_SHADER, "shader/mesh_fs.glsl");
+        m_mesh_vs     = dw::gl::Shader::create_from_file(GL_VERTEX_SHADER, "shader/mesh_vs.glsl");
+        m_mesh_fs     = dw::gl::Shader::create_from_file(GL_FRAGMENT_SHADER, "shader/mesh_fs.glsl");
+        m_bake_sdf_cs = dw::gl::Shader::create_from_file(GL_COMPUTE_SHADER, "shader/bake_sdf_cs.glsl");
 
-        if (!m_mesh_vs || !m_mesh_fs)
+        if (!m_mesh_vs || !m_mesh_fs || !m_bake_sdf_cs)
         {
             DW_LOG_FATAL("Failed to create Shaders");
             return false;
@@ -225,6 +238,15 @@ private:
         m_mesh_program = dw::gl::Program::create({ m_mesh_vs, m_mesh_fs });
 
         if (!m_mesh_program)
+        {
+            DW_LOG_FATAL("Failed to create Shader Program");
+            return false;
+        }
+
+        // Create general shader program
+        m_bake_sdf_program = dw::gl::Program::create({ m_bake_sdf_cs });
+
+        if (!m_bake_sdf_program)
         {
             DW_LOG_FATAL("Failed to create Shader Program");
             return false;
@@ -247,40 +269,48 @@ private:
 
     // -----------------------------------------------------------------------------------------------------------------------------------
 
-    bool load_sdf(const std::string& path, Instance& instance)
+    void bake_sdf(Instance& instance, float grid_step_size, int padding)
     {
-#define READ_AND_OFFSET(stream, dest, size, offset) \
-    stream.read((char*)dest, size);                 \
-    offset += size;                                 \
-    stream.seekg(offset);
+        glm::vec3  min_extents = instance.mesh->min_extents() - (glm::vec3(grid_step_size) * float(padding));
+        glm::vec3  max_extents = instance.mesh->max_extents() + (glm::vec3(grid_step_size) * float(padding));
+        glm::vec3  grid_origin = min_extents + glm::vec3(grid_step_size / 2.0f);
+        glm::vec3  box_size    = max_extents - min_extents;
+        glm::ivec3 volume_size = glm::ivec3(glm::ceil(box_size / glm::vec3(grid_step_size)));
 
-        std::fstream f(path, std::ios::in | std::ios::binary);
+        instance.volume_size    = volume_size;
+        instance.grid_origin    = grid_origin;
+        instance.grid_step_size = grid_step_size;
+        instance.min_extents    = min_extents;
+        instance.max_extents    = max_extents;
 
-        if (!f.is_open())
-            return false;
-
-        size_t offset = 0;
-
-        READ_AND_OFFSET(f, &instance.dimensions, sizeof(instance.dimensions), offset);
-        READ_AND_OFFSET(f, &instance.origin, sizeof(instance.origin), offset);
-        READ_AND_OFFSET(f, &instance.grid_spacing, sizeof(instance.grid_spacing), offset);
-
-        std::vector<float> data(instance.dimensions.x * instance.dimensions.y * instance.dimensions.z);
-
-        READ_AND_OFFSET(f, &data[0], sizeof(float) * data.size(), offset);
-
-        // Create volume texture
-        instance.sdf = dw::gl::Texture3D::create(instance.dimensions.x, instance.dimensions.y, instance.dimensions.z, 1, GL_R32F, GL_RED, GL_FLOAT);
+        instance.sdf = dw::gl::Texture3D::create(volume_size.x, volume_size.y, volume_size.z, 1, GL_R32F, GL_RED, GL_FLOAT);
         instance.sdf->set_min_filter(GL_LINEAR);
         instance.sdf->set_mag_filter(GL_LINEAR);
         instance.sdf->set_wrapping(GL_CLAMP_TO_EDGE, GL_CLAMP_TO_EDGE, GL_CLAMP_TO_EDGE);
 
-        size_t xy_slice_size = instance.dimensions.x * instance.dimensions.y;
+        m_bake_sdf_program->use();
 
-        for (int z = 0; z < instance.dimensions.z; z++)
-            instance.sdf->write_data(z, 0, data.data() + xy_slice_size * z);
+        m_bake_sdf_program->set_uniform("u_GridStepSize", glm::vec3(grid_step_size));
+        m_bake_sdf_program->set_uniform("u_GridOrigin", grid_origin);
+        m_bake_sdf_program->set_uniform("u_NumTriangles", static_cast<uint32_t>(instance.mesh->indices().size() / 3));
+        m_bake_sdf_program->set_uniform("u_VolumeSize", volume_size);
 
-        return true;
+        instance.sdf->bind_image(0, 0, 0, GL_READ_WRITE, instance.sdf->internal_format());
+
+        instance.mesh->vertex_buffer()->bind_base(GL_SHADER_STORAGE_BUFFER, 0);
+        instance.mesh->index_buffer()->bind_base(GL_SHADER_STORAGE_BUFFER, 1);
+
+        const uint32_t NUM_THREADS_X = 8;
+        const uint32_t NUM_THREADS_Y = 8;
+        const uint32_t NUM_THREADS_Z = 1;
+
+        uint32_t size_x = static_cast<uint32_t>(ceil(float(volume_size.x) / float(NUM_THREADS_X)));
+        uint32_t size_y = static_cast<uint32_t>(ceil(float(volume_size.y) / float(NUM_THREADS_Y)));
+        uint32_t size_z = static_cast<uint32_t>(ceil(float(volume_size.z) / float(NUM_THREADS_Z)));
+
+        glDispatchCompute(size_x, size_y, size_z);
+
+        glFinish();
     }
 
     // -----------------------------------------------------------------------------------------------------------------------------------
@@ -297,20 +327,14 @@ private:
             return false;
         }
 
-        if (!load_sdf("mesh/" + name + ".sdf", instance))
-        {
-            DW_LOG_FATAL("Failed to load SDF: " + name);
-            return false;
-        }
+        bake_sdf(instance, 0.025f, 4);
 
         m_instances.push_back(instance);
-
-        glm::vec3 half_extents = (instance.mesh->max_extents() - instance.mesh->min_extents()) / 2.0f;
 
         InstanceUniforms uniform;
 
         uniform.transform    = instance.transform;
-        uniform.half_extents = glm::vec4(half_extents, 0.0f);
+        uniform.half_extents = glm::vec4((instance.max_extents - instance.min_extents) / 2.0f, 0.0f);
         uniform.sdf_idx      = glm::ivec4(m_texture_uniforms.size(), 0, 0, 0);
 
         m_instance_uniforms.push_back(uniform);
@@ -324,7 +348,7 @@ private:
     bool load_scene()
     {
         std::string meshes[] = {
-            "sphere"
+            "bunny"
         };
 
         for (auto mesh : meshes)
@@ -452,9 +476,10 @@ private:
     void update_transforms(dw::Camera* camera)
     {
         // Update camera matrices.
-        m_global_uniforms.view_proj     = camera->m_projection * camera->m_view;
-        m_global_uniforms.cam_pos       = glm::vec4(camera->m_position, 0.0f);
-        m_global_uniforms.num_instances = m_instances.size();
+        m_global_uniforms.view_proj       = camera->m_projection * camera->m_view;
+        m_global_uniforms.cam_pos         = glm::vec4(camera->m_position, 0.0f);
+        m_global_uniforms.light_direction = glm::vec4(glm::normalize(glm::vec3(0.0f, m_light_pitch, -1.0f)), 0.0f);
+        m_global_uniforms.num_instances   = m_instances.size();
 
         for (int i = 0; i < m_instances.size(); i++)
         {
@@ -501,12 +526,14 @@ private:
 
 private:
     // General GPU resources.
-    dw::gl::Shader::Ptr        m_mesh_fs;
-    dw::gl::Shader::Ptr        m_mesh_vs;
-    dw::gl::Program::Ptr       m_mesh_program;
-    dw::gl::Buffer::Ptr m_global_ubo;
-    dw::gl::Buffer::Ptr m_instance_ubo;
-    dw::gl::Buffer::Ptr m_sdf_ubo;
+    dw::gl::Shader::Ptr  m_mesh_fs;
+    dw::gl::Shader::Ptr  m_mesh_vs;
+    dw::gl::Shader::Ptr  m_bake_sdf_cs;
+    dw::gl::Program::Ptr m_mesh_program;
+    dw::gl::Program::Ptr m_bake_sdf_program;
+    dw::gl::Buffer::Ptr  m_global_ubo;
+    dw::gl::Buffer::Ptr  m_instance_ubo;
+    dw::gl::Buffer::Ptr  m_sdf_ubo;
 
     std::vector<Instance>       m_instances;
     dw::Mesh::Ptr               m_ground;
@@ -528,10 +555,13 @@ private:
     float m_camera_x;
     float m_camera_y;
 
+    // Light
+    float m_light_pitch = -0.4f;
+
     // SDF
-    float m_t_min               = 0.0f;
+    float m_t_min               = 0.05f;
     float m_t_max               = 100.0f;
-    bool  m_soft_shadows        = false;
+    bool  m_soft_shadows        = true;
     float m_soft_shadows_k      = 4.0f;
     bool  m_draw_bounding_boxes = false;
 };
