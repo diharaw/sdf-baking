@@ -21,12 +21,11 @@ out vec4 FS_IN_NDCFragPos;
 // UNIFORMS ---------------------------------------------------------
 // ------------------------------------------------------------------
 
-layout(std140) uniform GlobalUniforms
+layout(std140, binding = 0) uniform GlobalUniforms
 {
     mat4 view_proj;
-    mat4 light_view;
-    mat4 light_view_proj;
     vec4 cam_pos;
+    int  num_instances;
 };
 
 uniform mat4 u_Model;

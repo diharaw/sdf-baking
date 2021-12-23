@@ -10,17 +10,41 @@
 #include <random>
 #include <chrono>
 #include <random>
+#include <fstream>
+
+#define CAMERA_FAR_PLANE 1000.0f
+#define NUM_INSTANCES 16
+#define NUM_SDFS 16
 
 struct GlobalUniforms
 {
     DW_ALIGNED(16)
     glm::mat4 view_proj;
     DW_ALIGNED(16)
-    glm::mat4 light_view;
-    DW_ALIGNED(16)
-    glm::mat4 light_view_proj;
-    DW_ALIGNED(16)
     glm::vec4 cam_pos;
+    DW_ALIGNED(16)
+    int32_t num_instances;
+};
+
+struct InstanceUniforms
+{
+    DW_ALIGNED(16)
+    glm::mat4 transform;
+    DW_ALIGNED(16)
+    glm::vec4 half_extents;
+    DW_ALIGNED(16)
+    glm::ivec4 sdf_idx;
+};
+
+struct Instance
+{
+    dw::Mesh::Ptr          mesh;
+    dw::gl::Texture3D::Ptr sdf;
+    glm::ivec3             dimensions;
+    glm::vec3              origin;
+    float                  grid_spacing;
+    glm::vec3              position  = glm::vec3(0.0f);
+    glm::mat4              transform = glm::mat4(1.0f);
 };
 
 class SDFShadows : public dw::Application
@@ -30,36 +54,21 @@ protected:
 
     bool init(int argc, const char* argv[]) override
     {
-        m_light_target              = glm::vec3(0.0f);
-        glm::vec3 default_light_dir = glm::normalize(glm::vec3(-0.5f, 0.99f, 0.5f));
-        m_light_direction           = -default_light_dir;
-        m_light_color               = glm::vec3(10000.0f);
-
         // Create GPU resources.
         if (!create_shaders())
+            return false;
+
+        if (!create_uniform_buffer())
             return false;
 
         // Load scene.
         if (!load_scene())
             return false;
 
-        create_textures();
-
-        if (!create_uniform_buffer())
-            return false;
+        update_textures();
 
         // Create camera.
         create_camera();
-
-        m_lucy_transform = glm::mat4(1.0f);
-        m_lucy_transform = glm::scale(m_lucy_transform, glm::vec3(0.1f));
-        m_lucy_transform = glm::rotate(m_lucy_transform, glm::radians(45.0f), glm::vec3(0.0, 1.0f, 0.0f));
-
-        m_pillar_transform = glm::mat4(1.0f);
-        m_pillar_transform = glm::scale(m_pillar_transform, glm::vec3(7.0f));
-
-        m_plane_transform = glm::mat4(1.0f);
-        m_plane_transform = glm::scale(m_plane_transform, glm::vec3(1.0f));
 
         return true;
     }
@@ -76,49 +85,38 @@ protected:
 
         update_uniforms();
 
-        glm::mat4 m        = glm::mat4(1.0f);
-        m_sphere_transform = glm::translate(m, glm::vec3(0.0f, 40.0f * (sin(glfwGetTime()) * 0.5f + 0.5f), 0.0f));
-        m_sphere_transform = glm::scale(m_sphere_transform, glm::vec3(5.0f));
+        render_scene();
 
-        render_shadow_map();
-        render_lit_scene();
+        m_debug_draw.set_depth_test(true);
 
-        if (m_visualize_frustum)
-            m_debug_draw.frustum(m_global_uniforms.light_view_proj, glm::vec3(1.0f, 0.0f, 0.0f));
+        if (m_draw_bounding_boxes)
+        {
+            for (const auto& instance : m_instances)
+                m_debug_draw.obb(instance.mesh->min_extents(), instance.mesh->max_extents(), instance.transform, glm::vec3(1.0f, 0.0f, 0.0f));
+        }
 
-        m_debug_draw.render(nullptr, m_width, m_height, m_global_uniforms.view_proj);
+        m_debug_draw.render(nullptr, m_width, m_height, m_main_camera->m_view_projection, m_main_camera->m_position);
     }
 
     // -----------------------------------------------------------------------------------------------------------------------------------
 
     void debug_gui()
     {
-        ImGui::Checkbox("Orthographic", &m_ortho);
-        ImGui::Checkbox("Visualize Light Frustum", &m_visualize_frustum);
-        ImGui::SliderFloat("Light Size", &m_light_size, 0.0f, 1.0f);
-        ImGui::SliderFloat("Light Bias", &m_shadow_bias, 0.0f, 1.0f);
-        ImGui::InputFloat("Light Near", &m_light_near);
-        ImGui::InputFloat("Light Far", &m_light_far);
+        ImGui::Checkbox("Draw Bounding Boxes", &m_draw_bounding_boxes);
+        ImGui::Checkbox("Soft Shadows", &m_soft_shadows);
+        ImGui::InputFloat("T-Min", &m_t_min);
+        ImGui::InputFloat("T-Max", &m_t_max);
+        ImGui::InputFloat("Soft Shadows K", &m_soft_shadows_k);
+
         ImGui::Separator();
-        ImGui::Text("Visualization");
-        ImGui::RadioButton("Shaded", &m_visualization, VISUALIZE_SHADING);
-        ImGui::RadioButton("Num Blockers", &m_visualization, VISUALIZE_NUM_BLOCKERS);
-        ImGui::RadioButton("Penumbra", &m_visualization, VISUALIZE_PENUMBRA);
 
+        for (int i = 0; i < m_instances.size(); i++)
         {
-            const char* listbox_items[] = { "Lucy", "Pillar", "Animated" };
+            auto& instance = m_instances[i];
 
-            ImGui::ListBox("Scene", &m_current_scene, listbox_items, IM_ARRAYSIZE(listbox_items), 3);
-        }
-
-        {
-            const char* listbox_items[] = { "25", "32", "64", "100", "128" };
-            const int   sample_counts[] = { 25, 32, 64, 100, 128 };
-            ImGui::ListBox("Blocker Search Samples", &m_blocker_search_samples_idx, listbox_items, IM_ARRAYSIZE(listbox_items), 5);
-            ImGui::ListBox("PCF Samples", &m_pcf_filter_samples_idx, listbox_items, IM_ARRAYSIZE(listbox_items), 5);
-
-            m_blocker_search_samples = sample_counts[m_blocker_search_samples_idx];
-            m_pcf_filter_samples     = sample_counts[m_pcf_filter_samples_idx];
+            ImGui::Text("Mesh %i", i);
+            ImGui::InputFloat3("Position", &instance.position.x);
+            ImGui::Separator();
         }
     }
 
@@ -128,8 +126,6 @@ protected:
     {
         // Override window resized method to update camera projection.
         m_main_camera->update_projection(60.0f, 1.0f, CAMERA_FAR_PLANE, float(m_width) / float(m_height));
-
-        create_textures();
     }
 
     // -----------------------------------------------------------------------------------------------------------------------------------
@@ -198,13 +194,12 @@ protected:
     {
         dw::AppSettings settings;
 
-        settings.resizable    = true;
-        settings.maximized    = false;
-        settings.refresh_rate = 60;
-        settings.major_ver    = 4;
-        settings.width        = 1920;
-        settings.height       = 1080;
-        settings.title        = "Area Light Shadows (c) 2019 Dihara Wijetunga";
+        settings.maximized             = false;
+        settings.major_ver             = 4;
+        settings.width                 = 1920;
+        settings.height                = 1080;
+        settings.title                 = "SDF Shadows (c) 2021 Dihara Wijetunga";
+        settings.enable_debug_callback = false;
 
         return settings;
     }
@@ -214,105 +209,25 @@ protected:
 private:
     // -----------------------------------------------------------------------------------------------------------------------------------
 
-    void render_lit_scene()
-    {
-        render_scene(nullptr, m_mesh_program, 0, 0, m_width, m_height, GL_NONE);
-    }
-
-    // -----------------------------------------------------------------------------------------------------------------------------------
-
-    void render_scene(std::unique_ptr<dw::gl::Program>& program)
-    {
-        if (m_current_scene == SCENE_LUCY)
-            render_mesh(m_lucy, m_lucy_transform, program, glm::vec3(0.5f));
-        else if (m_current_scene == SCENE_PILLAR)
-        {
-            glDisable(GL_CULL_FACE);
-            render_mesh(m_pillar, m_pillar_transform, program, glm::vec3(0.5f));
-            glEnable(GL_CULL_FACE);
-        }
-        else if (m_current_scene == SCENE_ANIMATED)
-            render_mesh(m_sphere, m_sphere_transform, program, glm::vec3(0.5f));
-    }
-
-    // -----------------------------------------------------------------------------------------------------------------------------------
-
-    void render_shadow_map()
-    {
-        glEnable(GL_DEPTH_TEST);
-        glDisable(GL_BLEND);
-        glDisable(GL_CULL_FACE);
-
-        m_shadow_map_fbo->bind();
-
-        glViewport(0, 0, SHADOW_MAP_SIZE, SHADOW_MAP_SIZE);
-
-        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-        glClearDepth(1.0);
-        glClear(GL_DEPTH_BUFFER_BIT);
-
-        // Bind shader program.
-        m_shadow_map_program->use();
-
-        // Bind uniform buffers.
-        m_global_ubo->bind_base(0);
-
-        // Draw scene.
-        render_mesh(m_plane, m_plane_transform, m_shadow_map_program, glm::vec3(0.5f));
-
-        render_scene(m_shadow_map_program);
-    }
-
-    // -----------------------------------------------------------------------------------------------------------------------------------
-
     bool create_shaders()
     {
+        // Create general shaders
+        m_mesh_vs = dw::gl::Shader::create_from_file(GL_VERTEX_SHADER, "shader/mesh_vs.glsl");
+        m_mesh_fs = dw::gl::Shader::create_from_file(GL_FRAGMENT_SHADER, "shader/mesh_fs.glsl");
+
+        if (!m_mesh_vs || !m_mesh_fs)
         {
-            // Create general shaders
-            m_mesh_vs       = std::unique_ptr<dw::gl::Shader>(dw::gl::Shader::create_from_file(GL_VERTEX_SHADER, "shader/mesh_vs.glsl"));
-            m_shadow_map_vs = std::unique_ptr<dw::gl::Shader>(dw::gl::Shader::create_from_file(GL_VERTEX_SHADER, "shader/shadow_map_vs.glsl"));
-            m_mesh_fs       = std::unique_ptr<dw::gl::Shader>(dw::gl::Shader::create_from_file(GL_FRAGMENT_SHADER, "shader/mesh_fs.glsl"));
-            m_depth_fs      = std::unique_ptr<dw::gl::Shader>(dw::gl::Shader::create_from_file(GL_FRAGMENT_SHADER, "shader/depth_fs.glsl"));
+            DW_LOG_FATAL("Failed to create Shaders");
+            return false;
+        }
 
-            {
-                if (!m_shadow_map_vs || !m_depth_fs)
-                {
-                    DW_LOG_FATAL("Failed to create Shaders");
-                    return false;
-                }
+        // Create general shader program
+        m_mesh_program = dw::gl::Program::create({ m_mesh_vs, m_mesh_fs });
 
-                // Create general shader program
-                dw::gl::Shader* shaders[] = { m_shadow_map_vs.get(), m_depth_fs.get() };
-                m_shadow_map_program      = std::make_unique<dw::gl::Program>(2, shaders);
-
-                if (!m_shadow_map_program)
-                {
-                    DW_LOG_FATAL("Failed to create Shader Program");
-                    return false;
-                }
-
-                m_shadow_map_program->uniform_block_binding("GlobalUniforms", 0);
-            }
-
-            {
-                if (!m_mesh_vs || !m_mesh_fs)
-                {
-                    DW_LOG_FATAL("Failed to create Shaders");
-                    return false;
-                }
-
-                // Create general shader program
-                dw::gl::Shader* shaders[] = { m_mesh_vs.get(), m_mesh_fs.get() };
-                m_mesh_program            = std::make_unique<dw::gl::Program>(2, shaders);
-
-                if (!m_mesh_program)
-                {
-                    DW_LOG_FATAL("Failed to create Shader Program");
-                    return false;
-                }
-
-                m_mesh_program->uniform_block_binding("GlobalUniforms", 0);
-            }
+        if (!m_mesh_program)
+        {
+            DW_LOG_FATAL("Failed to create Shader Program");
+            return false;
         }
 
         return true;
@@ -320,24 +235,81 @@ private:
 
     // -----------------------------------------------------------------------------------------------------------------------------------
 
-    void create_textures()
+    bool create_uniform_buffer()
     {
-        m_shadow_map = std::make_unique<dw::gl::Texture2D>(SHADOW_MAP_SIZE, SHADOW_MAP_SIZE, 1, 1, 1, GL_DEPTH_COMPONENT32F, GL_DEPTH_COMPONENT, GL_FLOAT);
-        m_shadow_map->set_wrapping(GL_CLAMP_TO_BORDER, GL_CLAMP_TO_BORDER, GL_CLAMP_TO_BORDER);
-        m_shadow_map->set_border_color(1.0f, 1.0f, 1.0f, 1.0f);
-        m_shadow_map->set_min_filter(GL_NEAREST);
-        m_shadow_map->set_mag_filter(GL_NEAREST);
+        // Create uniform buffer for global data
+        m_global_ubo   = dw::gl::UniformBuffer::create(GL_DYNAMIC_DRAW, sizeof(GlobalUniforms));
+        m_instance_ubo = dw::gl::UniformBuffer::create(GL_DYNAMIC_DRAW, sizeof(InstanceUniforms) * NUM_INSTANCES);
+        m_sdf_ubo      = dw::gl::UniformBuffer::create(GL_DYNAMIC_DRAW, sizeof(uint64_t) * NUM_SDFS * 2);
 
-        m_shadow_map_fbo = std::make_unique<dw::gl::Framebuffer>();
-        m_shadow_map_fbo->attach_depth_stencil_target(m_shadow_map.get(), 0, 0);
+        return true;
     }
 
     // -----------------------------------------------------------------------------------------------------------------------------------
 
-    bool create_uniform_buffer()
+    bool load_sdf(const std::string& path, Instance& instance)
     {
-        // Create uniform buffer for global data
-        m_global_ubo = std::make_unique<dw::gl::UniformBuffer>(GL_DYNAMIC_DRAW, sizeof(GlobalUniforms));
+#define READ_AND_OFFSET(stream, dest, size, offset) \
+    stream.read((char*)dest, size);                 \
+    offset += size;                                 \
+    stream.seekg(offset);
+
+        std::fstream f(path, std::ios::in | std::ios::binary);
+
+        if (!f.is_open())
+            return false;
+
+        size_t offset = 0;
+
+        READ_AND_OFFSET(f, &instance.dimensions, sizeof(instance.dimensions), offset);
+        READ_AND_OFFSET(f, &instance.origin, sizeof(instance.origin), offset);
+        READ_AND_OFFSET(f, &instance.grid_spacing, sizeof(instance.grid_spacing), offset);
+
+        std::vector<float> data(instance.dimensions.x * instance.dimensions.y * instance.dimensions.z);
+
+        READ_AND_OFFSET(f, &data[0], sizeof(float) * data.size(), offset);
+
+        // Create volume texture
+        instance.sdf = dw::gl::Texture3D::create(instance.dimensions.x, instance.dimensions.y, instance.dimensions.z, 1, GL_R32F, GL_RED, GL_FLOAT);
+        instance.sdf->set_min_filter(GL_LINEAR);
+        instance.sdf->set_mag_filter(GL_LINEAR);
+        instance.sdf->set_data(0, data.data());
+
+        return true;
+    }
+
+    // -----------------------------------------------------------------------------------------------------------------------------------
+
+    bool load_mesh(const std::string& name)
+    {
+        Instance instance;
+
+        instance.mesh = dw::Mesh::load("mesh/" + name + ".obj");
+
+        if (!instance.mesh)
+        {
+            DW_LOG_FATAL("Failed to load mesh: " + name);
+            return false;
+        }
+
+        if (!load_sdf("mesh/" + name + ".sdf", instance))
+        {
+            DW_LOG_FATAL("Failed to load SDF: " + name);
+            return false;
+        }
+
+        m_instances.push_back(instance);
+
+        glm::vec3 half_extents = (instance.mesh->max_extents() - instance.mesh->min_extents()) / 2.0f;
+
+        InstanceUniforms uniform;
+
+        uniform.transform    = instance.transform;
+        uniform.half_extents = glm::vec4(half_extents, 0.0f);
+        uniform.sdf_idx      = glm::ivec4(m_texture_uniforms.size(), 0, 0, 0);
+
+        m_instance_uniforms.push_back(uniform);
+        m_texture_uniforms.push_back(instance.sdf->make_texture_handle_resident());
 
         return true;
     }
@@ -346,14 +318,24 @@ private:
 
     bool load_scene()
     {
-        m_lucy   = dw::Mesh::load("mesh/lucy.obj");
-        m_pillar = dw::Mesh::load("mesh/pillar.obj");
-        m_plane  = dw::Mesh::load("mesh/plane.obj");
-        m_sphere = dw::Mesh::load("mesh/sphere.obj");
+        std::string meshes[] = {
+            "sphere"
+        };
 
-        if (!m_lucy || !m_pillar || !m_plane || !m_sphere)
+        for (auto mesh : meshes)
         {
-            DW_LOG_FATAL("Failed to load mesh!");
+            if (!load_mesh(mesh))
+            {
+                DW_LOG_FATAL("Failed to create mesh instance: " + mesh);
+                return false;
+            }
+        }
+
+        m_ground = dw::Mesh::load("mesh/ground.obj");
+
+        if (!m_ground)
+        {
+            DW_LOG_FATAL("Failed to load mesh: plane");
             return false;
         }
 
@@ -371,20 +353,18 @@ private:
 
     // -----------------------------------------------------------------------------------------------------------------------------------
 
-    void render_mesh(dw::Mesh::Ptr mesh, glm::mat4 model, std::unique_ptr<dw::gl::Program>& program, glm::vec3 color)
+    void render_mesh(dw::Mesh::Ptr mesh, glm::mat4 model, glm::vec3 color)
     {
-        program->set_uniform("u_Model", model);
+        m_mesh_program->set_uniform("u_Model", model);
 
         // Bind vertex array.
         mesh->mesh_vertex_array()->bind();
 
-        for (uint32_t i = 0; i < mesh->sub_mesh_count(); i++)
-        {
-            dw::SubMesh& submesh = mesh->sub_meshes()[i];
+        const auto& submeshes = mesh->sub_meshes();
 
-            program->set_uniform("u_Color", color);
-            program->set_uniform("u_Direction", m_light_direction);
-            program->set_uniform("u_LightColor", m_light_color);
+        for (uint32_t i = 0; i < submeshes.size(); i++)
+        {
+            const dw::SubMesh& submesh = submeshes[i];
 
             // Issue draw call.
             glDrawElementsBaseVertex(GL_TRIANGLES, submesh.index_count, GL_UNSIGNED_INT, (void*)(sizeof(unsigned int) * submesh.base_index), submesh.base_vertex);
@@ -393,77 +373,73 @@ private:
 
     // -----------------------------------------------------------------------------------------------------------------------------------
 
-    void render_scene(dw::gl::Framebuffer* fbo, std::unique_ptr<dw::gl::Program>& program, int x, int y, int w, int h, GLenum cull_face, bool clear = true)
+    void render_scene()
     {
         glEnable(GL_DEPTH_TEST);
         glDisable(GL_BLEND);
+        glEnable(GL_CULL_FACE);
+        glCullFace(GL_BACK);
 
-        if (cull_face == GL_NONE)
-            glDisable(GL_CULL_FACE);
-        else
-        {
-            glEnable(GL_CULL_FACE);
-            glCullFace(cull_face);
-        }
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glViewport(0, 0, m_width, m_height);
 
-        if (fbo)
-            fbo->bind();
-        else
-            glBindFramebuffer(GL_FRAMEBUFFER, 0);
-
-        glViewport(x, y, w, h);
-
-        if (clear)
-        {
-            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-            glClearDepth(1.0);
-            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-        }
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClearDepth(1.0);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
         // Bind shader program.
-        program->use();
+        m_mesh_program->use();
 
-        program->set_uniform("u_LightBias", m_shadow_bias);
-        program->set_uniform("u_LightSize", m_light_size);
-        program->set_uniform("u_LightNear", m_light_near);
-        program->set_uniform("u_LightFar", m_light_far);
-        program->set_uniform("u_Ortho", (int)m_ortho);
-        program->set_uniform("u_Visualization", m_visualization);
-        program->set_uniform("u_BlockerSearchSamples", m_blocker_search_samples);
-        program->set_uniform("u_PCFSamples", m_pcf_filter_samples);
-        program->set_uniform("u_BlockerSearchScale", m_blocker_search_scale);
-
-        if (program->set_uniform("s_ShadowMap", 1))
-            m_shadow_map->bind(1);
+        // Bind SDF texture
+        m_mesh_program->set_uniform("u_SDFSoftShadows", m_soft_shadows);
+        m_mesh_program->set_uniform("u_SDFTMin", m_t_min);
+        m_mesh_program->set_uniform("u_SDFTMax", m_t_max);
+        m_mesh_program->set_uniform("u_SDFSoftShadowsK", m_soft_shadows_k);
 
         // Bind uniform buffers.
         m_global_ubo->bind_base(0);
+        m_instance_ubo->bind_base(1);
+        m_sdf_ubo->bind_base(2);
 
         // Draw scene.
-        render_mesh(m_plane, m_plane_transform, program, glm::vec3(0.5f));
+        render_mesh(m_ground, glm::mat4(1.0f), glm::vec3(0.5f));
 
-        render_scene(program);
+        for (const auto& instance : m_instances)
+            render_mesh(instance.mesh, instance.transform, glm::vec3(0.5f));
     }
 
     // -----------------------------------------------------------------------------------------------------------------------------------
 
     void update_uniforms()
     {
-        glm::vec3 light_camera_pos = m_light_target - m_light_direction * 200.0f;
-        glm::mat4 view             = glm::lookAt(light_camera_pos, m_light_target, glm::vec3(0.0f, 1.0f, 0.0f));
-        glm::mat4 proj;
+        // Global
+        {
+            void* ptr = m_global_ubo->map(GL_WRITE_ONLY);
+            memcpy(ptr, &m_global_uniforms, sizeof(GlobalUniforms));
+            m_global_ubo->unmap();
+        }
 
-        if (m_ortho)
-            proj = glm::ortho(-SHADOW_MAP_EXTENTS, SHADOW_MAP_EXTENTS, -SHADOW_MAP_EXTENTS, SHADOW_MAP_EXTENTS, m_light_near, m_light_far);
-        else
-            proj = glm::perspective(glm::radians(60.0f), 1.0f, m_light_near, m_light_far);
+        // Instance
+        {
+            void* ptr = m_instance_ubo->map(GL_WRITE_ONLY);
+            memcpy(ptr, m_instance_uniforms.data(), sizeof(InstanceUniforms) * m_instances.size());
+            m_instance_ubo->unmap();
+        }
+    }
 
-        m_global_uniforms.light_view      = view;
-        m_global_uniforms.light_view_proj = proj * view;
+    // -----------------------------------------------------------------------------------------------------------------------------------
 
-        void* ptr = m_global_ubo->map(GL_WRITE_ONLY);
-        memcpy(ptr, &m_global_uniforms, sizeof(GlobalUniforms));
-        m_global_ubo->unmap();
+    void update_textures()
+    {
+        uint64_t* ptr = (uint64_t*)m_sdf_ubo->map(GL_WRITE_ONLY);
+
+        for (int i = 0; i < m_texture_uniforms.size(); i++)
+        {
+            memcpy(ptr, &m_texture_uniforms[i], sizeof(uint64_t));
+            ptr += 2;
+        }
+
+        m_sdf_ubo->unmap();
     }
 
     // -----------------------------------------------------------------------------------------------------------------------------------
@@ -471,8 +447,16 @@ private:
     void update_transforms(dw::Camera* camera)
     {
         // Update camera matrices.
-        m_global_uniforms.view_proj = camera->m_projection * camera->m_view;
-        m_global_uniforms.cam_pos   = glm::vec4(camera->m_position, 0.0f);
+        m_global_uniforms.view_proj     = camera->m_projection * camera->m_view;
+        m_global_uniforms.cam_pos       = glm::vec4(camera->m_position, 0.0f);
+        m_global_uniforms.num_instances = m_instances.size();
+
+        for (int i = 0; i < m_instances.size(); i++)
+        {
+            auto& instance                   = m_instances[i];
+            instance.transform               = glm::translate(glm::mat4(1.0f), instance.position);
+            m_instance_uniforms[i].transform = instance.transform;
+        }
     }
 
     // -----------------------------------------------------------------------------------------------------------------------------------
@@ -512,33 +496,20 @@ private:
 
 private:
     // General GPU resources.
-    std::unique_ptr<dw::gl::Shader> m_mesh_fs;
-    std::unique_ptr<dw::gl::Shader> m_depth_fs;
+    dw::gl::Shader::Ptr        m_mesh_fs;
+    dw::gl::Shader::Ptr        m_mesh_vs;
+    dw::gl::Program::Ptr       m_mesh_program;
+    dw::gl::UniformBuffer::Ptr m_global_ubo;
+    dw::gl::UniformBuffer::Ptr m_instance_ubo;
+    dw::gl::UniformBuffer::Ptr m_sdf_ubo;
 
-    std::unique_ptr<dw::gl::Shader> m_mesh_vs;
-    std::unique_ptr<dw::gl::Shader> m_shadow_map_vs;
-
-    std::unique_ptr<dw::gl::Program> m_mesh_program;
-    std::unique_ptr<dw::gl::Program> m_shadow_map_program;
-
-    std::unique_ptr<dw::gl::Framebuffer> m_shadow_map_fbo;
-    std::unique_ptr<dw::gl::Texture2D>   m_shadow_map;
-
-    std::unique_ptr<dw::gl::UniformBuffer> m_global_ubo;
-
-    dw::Mesh::Ptr               m_sphere;
-    dw::Mesh::Ptr               m_lucy;
-    dw::Mesh::Ptr               m_pillar;
-    dw::Mesh::Ptr               m_plane;
+    std::vector<Instance>       m_instances;
+    dw::Mesh::Ptr               m_ground;
     std::unique_ptr<dw::Camera> m_main_camera;
 
-    GlobalUniforms m_global_uniforms;
-
-    // Scene
-    glm::mat4 m_lucy_transform;
-    glm::mat4 m_pillar_transform;
-    glm::mat4 m_plane_transform;
-    glm::mat4 m_sphere_transform;
+    GlobalUniforms                m_global_uniforms;
+    std::vector<InstanceUniforms> m_instance_uniforms;
+    std::vector<uint64_t>         m_texture_uniforms;
 
     // Camera controls.
     bool  m_mouse_look         = false;
@@ -546,32 +517,18 @@ private:
     float m_sideways_speed     = 0.0f;
     float m_camera_sensitivity = 0.05f;
     float m_camera_speed       = 0.05f;
-    float m_offset             = 0.1f;
     bool  m_debug_gui          = true;
-    bool  m_ortho              = true;
-    bool  m_visualize_frustum  = false;
-
-    glm::vec3 m_light_target;
-    glm::vec3 m_light_direction;
-    glm::vec3 m_light_color;
-
-    // Shadow Mapping.
-    float     m_shadow_bias = 0.008f;
-    glm::mat4 m_light_view_proj;
-    int       m_blocker_search_samples_idx = 4;
-    int       m_blocker_search_samples     = 128;
-    int       m_pcf_filter_samples_idx     = 4;
-    int       m_pcf_filter_samples         = 128;
-    float     m_light_near                 = 120.0f;
-    float     m_light_far                  = 250.0f;
-    float     m_blocker_search_scale       = 1.0f;
-    int       m_visualization              = 0;
-    int       m_current_scene              = SCENE_LUCY;
 
     // Camera orientation.
     float m_camera_x;
     float m_camera_y;
-    float m_light_size = 0.07f;
+
+    // SDF
+    float m_t_min               = 0.0f;
+    float m_t_max               = 100.0f;
+    bool  m_soft_shadows        = false;
+    float m_soft_shadows_k      = 4.0f;
+    bool  m_draw_bounding_boxes = false;
 };
 
 DW_DECLARE_MAIN(SDFShadows)
