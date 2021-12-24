@@ -23,8 +23,6 @@ struct GlobalUniforms
     DW_ALIGNED(16)
     glm::vec4 cam_pos;
     DW_ALIGNED(16)
-    glm::vec4 light_direction;
-    DW_ALIGNED(16)
     int32_t num_instances;
 };
 
@@ -35,11 +33,11 @@ struct InstanceUniforms
     DW_ALIGNED(16)
     glm::vec4 half_extents;
     DW_ALIGNED(16)
-    glm::vec4      os_center;
+    glm::vec4 os_center;
     DW_ALIGNED(16)
-    glm::vec4      ws_center;
+    glm::vec4 ws_center;
     DW_ALIGNED(16)
-    glm::vec4      ws_axis[3];
+    glm::vec4 ws_axis[3];
     DW_ALIGNED(16)
     glm::ivec4 sdf_idx;
 };
@@ -65,7 +63,7 @@ struct Instance
     glm::mat4 transform = glm::mat4(1.0f);
 };
 
-class SDFShadows : public dw::Application
+class SDFBaking : public dw::Application
 {
 protected:
     // -----------------------------------------------------------------------------------------------------------------------------------
@@ -126,6 +124,17 @@ protected:
         ImGui::InputFloat("T-Max", &m_t_max);
         ImGui::SliderFloat("Soft Shadows K", &m_soft_shadows_k, 1.0f, 16.0f);
         ImGui::SliderFloat("Light Pitch", &m_light_pitch, -1.0f, 1.0f);
+        ImGui::InputFloat3("Light Position", &m_light_pos.x);
+        ImGui::SliderFloat("Light Inner Cutoff", &m_light_inner_cutoff, 0.0f, 90.0f);
+        ImGui::SliderFloat("Light Outer Cutoff", &m_light_outer_cutoff, 0.0f, 90.0f);
+        ImGui::SliderFloat("Light Range", &m_light_range, 0.0f, 100.0f);
+
+        ImGui::Separator();
+
+        ImGui::Checkbox("Ambient Occlusion", &m_ao);
+        ImGui::SliderFloat("AO Strength", &m_ao_strength, 0.0f, 1.0f);
+        ImGui::SliderFloat("AO Step Size", &m_ao_step_size, 0.01f, 1.0f);
+        ImGui::SliderInt("AO Num Steps", &m_ao_num_steps, 1, 32);
 
         ImGui::Separator();
 
@@ -222,7 +231,7 @@ protected:
         settings.major_ver             = 4;
         settings.width                 = 1920;
         settings.height                = 1080;
-        settings.title                 = "SDF Shadows (c) 2021 Dihara Wijetunga";
+        settings.title                 = "SDF Baking";
         settings.enable_debug_callback = false;
 
         return settings;
@@ -331,7 +340,7 @@ private:
     {
         Instance instance;
 
-        instance.mesh = dw::Mesh::load("mesh/" + name + ".obj");
+        instance.mesh     = dw::Mesh::load("mesh/" + name + ".obj");
         instance.color    = color;
         instance.position = position;
         instance.rotation = rotation;
@@ -364,25 +373,29 @@ private:
     {
         std::string meshes[] = {
             "bunny",
-            "sphere"
+            "sphere",
+            "cylinder"
         };
 
         glm::vec3 positions[] = {
-            glm::vec3(-2.0f, 0.0f, 5.0f),
-            glm::vec3(2.0f, 0.0f, 5.0f)
+            glm::vec3(0.0f, 0.0f, 1.0f),
+            glm::vec3(4.0f, 0.0f, 1.0f),
+            glm::vec3(-4.0f, 0.0f, 1.0f)
         };
 
         float rotations[] = {
-            45.0f,
+            0.0f,
+            0.0f,
             0.0f
         };
 
         glm::vec3 colors[] = {
             glm::vec3(0.569844782f, 0.157939225f, 0.157963991f),
-            glm::vec3(0.334582895f, 0.503325939f, 0.222088382f)
+            glm::vec3(0.334582895f, 0.503325939f, 0.222088382f),
+            glm::vec3(0.103627160f, 0.303517729f, 0.482233524f)
         };
 
-        for (int i = 0; i < 2; i++)
+        for (int i = 0; i < 3; i++)
         {
             if (!load_mesh(meshes[i], positions[i], rotations[i], colors[i]))
             {
@@ -406,8 +419,7 @@ private:
 
     void create_camera()
     {
-        m_main_camera = std::make_unique<dw::Camera>(60.0f, 1.0f, CAMERA_FAR_PLANE, float(m_width) / float(m_height), glm::vec3(50.0f, 20.0f, 0.0f), glm::vec3(-1.0f, 0.0, 0.0f));
-        m_main_camera->set_rotatation_delta(glm::vec3(0.0f, -90.0f, 0.0f));
+        m_main_camera = std::make_unique<dw::Camera>(60.0f, 1.0f, CAMERA_FAR_PLANE, float(m_width) / float(m_height), glm::vec3(0.0f, 3.0f, 15.0f), glm::vec3(-1.0f, 0.0, 0.0f));
         m_main_camera->update();
     }
 
@@ -456,6 +468,15 @@ private:
         m_mesh_program->set_uniform("u_SDFTMin", m_t_min);
         m_mesh_program->set_uniform("u_SDFTMax", m_t_max);
         m_mesh_program->set_uniform("u_SDFSoftShadowsK", m_soft_shadows_k);
+        m_mesh_program->set_uniform("u_AOStepSize", m_ao_step_size);
+        m_mesh_program->set_uniform("u_AOStrength", m_ao_strength);
+        m_mesh_program->set_uniform("u_AONumSteps", m_ao_num_steps);
+        m_mesh_program->set_uniform("u_AO", m_ao);
+        m_mesh_program->set_uniform("u_LightPos", m_light_pos);
+        m_mesh_program->set_uniform("u_LightDirection", glm::normalize(glm::vec3(0.0f, m_light_pitch, -1.0f)));
+        m_mesh_program->set_uniform("u_LightInnerCutoff", cosf(glm::radians(m_light_inner_cutoff)));
+        m_mesh_program->set_uniform("u_LightOuterCutoff", cosf(glm::radians(m_light_outer_cutoff)));
+        m_mesh_program->set_uniform("u_LightRange", m_light_range);
 
         // Bind uniform buffers.
         m_global_ubo->bind_base(0);
@@ -508,25 +529,24 @@ private:
     void update_transforms(dw::Camera* camera)
     {
         // Update camera matrices.
-        m_global_uniforms.view_proj       = camera->m_projection * camera->m_view;
-        m_global_uniforms.cam_pos         = glm::vec4(camera->m_position, 0.0f);
-        m_global_uniforms.light_direction = glm::vec4(glm::normalize(glm::vec3(0.0f, m_light_pitch, -1.0f)), 0.0f);
-        m_global_uniforms.num_instances   = m_instances.size();
+        m_global_uniforms.view_proj     = camera->m_projection * camera->m_view;
+        m_global_uniforms.cam_pos       = glm::vec4(camera->m_position, 0.0f);
+        m_global_uniforms.num_instances = m_instances.size();
 
         for (int i = 0; i < m_instances.size(); i++)
         {
-            auto& instance                           = m_instances[i];
+            auto& instance = m_instances[i];
 
-            instance.transform               = glm::translate(glm::mat4(1.0f), instance.position);
+            instance.transform = glm::translate(glm::mat4(1.0f), instance.position);
 
             if (instance.animate)
                 instance.transform = instance.transform * glm::rotate(glm::mat4(1.0f), glm::radians(float(glfwGetTime()) * 10.0f), glm::vec3(0.0f, 1.0f, 0.0f));
-            else 
+            else
                 instance.transform = instance.transform * glm::rotate(glm::mat4(1.0f), glm::radians(instance.rotation), glm::vec3(0.0f, 1.0f, 0.0f));
 
             m_instance_uniforms[i].inverse_transform = glm::inverse(instance.transform);
-            m_instance_uniforms[i].ws_center = instance.transform * m_instance_uniforms[i].os_center;
-            
+            m_instance_uniforms[i].ws_center         = instance.transform * m_instance_uniforms[i].os_center;
+
             glm::vec3 axis[] = {
                 glm::vec3(1.0f, 0.0f, 0.0f),
                 glm::vec3(0.0f, 1.0f, 0.0f),
@@ -605,14 +625,24 @@ private:
     float m_camera_y;
 
     // Light
-    float m_light_pitch = -0.4f;
+    float     m_light_pitch        = -0.9f;
+    glm::vec3 m_light_pos          = glm::vec3(0.0f, 30.0f, 35.0f);
+    float     m_light_inner_cutoff = 3.4f;
+    float     m_light_outer_cutoff = 8.7f;
+    float     m_light_range        = 100.0f;
+
+    // AO
+    bool  m_ao           = true;
+    float m_ao_strength  = 0.16f;
+    float m_ao_step_size = 0.15f;
+    int   m_ao_num_steps = 8;
 
     // SDF
     float m_t_min               = 0.2f;
     float m_t_max               = 100.0f;
     bool  m_soft_shadows        = true;
-    float m_soft_shadows_k      = 4.0f;
+    float m_soft_shadows_k      = 5.7f;
     bool  m_draw_bounding_boxes = false;
 };
 
-DW_DECLARE_MAIN(SDFShadows)
+DW_DECLARE_MAIN(SDFBaking)

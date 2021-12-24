@@ -45,7 +45,6 @@ layout(std140, binding = 0) uniform GlobalUniforms
 {
     mat4 view_proj;
     vec4 cam_pos;
-    vec4 light_direction;
     int  num_instances;
 };
 
@@ -64,6 +63,15 @@ uniform bool  u_SDFSoftShadows;
 uniform float u_SDFTMin;
 uniform float u_SDFTMax;
 uniform float u_SDFSoftShadowsK;
+uniform float u_AOStepSize;
+uniform float u_AOStrength;
+uniform int   u_AONumSteps;
+uniform bool  u_AO;
+uniform vec3  u_LightPos;
+uniform vec3  u_LightDirection;
+uniform float u_LightInnerCutoff;
+uniform float u_LightOuterCutoff;
+uniform float u_LightRange;
 
 // ------------------------------------------------------------------
 // FUNCTIONS --------------------------------------------------------
@@ -79,7 +87,7 @@ vec3 transform_point(vec3 ws_p, mat4 t)
 float sample_sdf(in vec3 os_p, in Instance instance)
 {
     vec3 remapped_p = os_p - (instance.os_center.xyz - instance.half_extents.xyz);
-    vec3 box_size = instance.half_extents.xyz * 2.0f;
+    vec3 box_size   = instance.half_extents.xyz * 2.0f;
 
     vec3 uvw = (remapped_p / box_size);
     return textureLod(sdf[instance.sdf_idx.x], uvw, 0.0f).r;
@@ -99,11 +107,11 @@ bool inside_obb(in vec3 os_p, in Instance instance)
 
 vec3 calculate_normal(in vec3 os_p, in Instance instance)
 {
-    const float eps = 0.0001f; 
-    const vec2 h = vec2(eps, 0.0f);
-    return normalize( vec3(sample_sdf(os_p + h.xyy, instance) - sample_sdf(os_p - h.xyy, instance),
-                           sample_sdf(os_p + h.yxy, instance) - sample_sdf(os_p - h.yxy, instance),
-                           sample_sdf(os_p + h.yyx, instance) - sample_sdf(os_p - h.yyx, instance) ) );
+    const float eps = 0.0001f;
+    const vec2  h   = vec2(eps, 0.0f);
+    return normalize(vec3(sample_sdf(os_p + h.xyy, instance) - sample_sdf(os_p - h.xyy, instance),
+                          sample_sdf(os_p + h.yxy, instance) - sample_sdf(os_p - h.yxy, instance),
+                          sample_sdf(os_p + h.yyx, instance) - sample_sdf(os_p - h.yyx, instance)));
 }
 
 // ------------------------------------------------------------------
@@ -111,20 +119,20 @@ vec3 calculate_normal(in vec3 os_p, in Instance instance)
 vec3 find_closest_point_on_obb(in vec3 ws_p, in Instance instance)
 {
     vec3 c = instance.ws_center.xyz;
-    
+
     vec3 d = ws_p - c;
     vec3 q = c;
-    
+
     for (int i = 0; i < 3; i++)
     {
         float dist = dot(d, instance.ws_axis[i].xyz);
-        
+
         if (dist > instance.half_extents[i]) dist = instance.half_extents[i];
         if (dist < -instance.half_extents[i]) dist = -instance.half_extents[i];
-        
+
         q += dist * instance.ws_axis[i].xyz;
     }
-    
+
     return q;
 }
 
@@ -147,12 +155,12 @@ float evaluate_mesh_sdf(in vec3 ws_p, in Instance instance)
 
     if (inside_obb(os_p, instance))
         return sample_sdf(os_p, instance);
-    else 
+    else
     {
-#if defined(USE_ACCURATE_DISTANCE)        
+#if defined(USE_ACCURATE_DISTANCE)
         vec3 point_on_volume = find_closest_point_on_obb(ws_p, instance);
-        vec3 point_on_mesh = find_closest_point_on_mesh(point_on_volume, instance);
-    
+        vec3 point_on_mesh   = find_closest_point_on_mesh(point_on_volume, instance);
+
         float h = length(point_on_mesh - ws_p);
 
         return h;
@@ -205,18 +213,40 @@ float shadow_ray_march(vec3 ro, vec3 rd, float k)
 }
 
 // ------------------------------------------------------------------
+
+// https://www.alanzucconi.com/2016/07/01/ambient-occlusion/
+float ambient_occlusion(vec3 pos, vec3 normal, int num_steps, float step_size)
+{
+    float sum     = 0;
+    float max_sum = 0;
+    for (int i = 0; i < num_steps; i++)
+    {
+        vec3 p = pos + normal * (i + 1) * step_size;
+        sum += 1. / pow(2., i) * evaluate_scene_sdf(p);
+        max_sum += 1. / pow(2., i) * (i + 1) * step_size;
+    }
+    return min(sum / max_sum, 1.0f);
+}
+
+// ------------------------------------------------------------------
 // MAIN -------------------------------------------------------------
 // ------------------------------------------------------------------
 
 void main()
 {
     vec3 albedo = u_Color;
-    vec3 L      = -light_direction.xyz;
     vec3 N      = normalize(FS_IN_Normal);
+    vec3 L      = normalize(u_LightPos - FS_IN_WorldPos); // FragPos -> LightPos vector
 
-    float shadow = shadow_ray_march(FS_IN_WorldPos, L, u_SDFSoftShadowsK);
+    float theta       = dot(L, normalize(-u_LightDirection));
+    float distance    = length(FS_IN_WorldPos - u_LightPos);
+    float epsilon     = u_LightInnerCutoff - u_LightOuterCutoff;
+    float attenuation = smoothstep(u_LightRange, 0, distance) * clamp((theta - u_LightOuterCutoff) / epsilon, 0.0, 1.0);
 
-    FS_OUT_Color = albedo * clamp(dot(N, L), 0.0, 1.0) * shadow + albedo * 0.1f;
+    float shadow = shadow_ray_march(FS_IN_WorldPos, L, u_SDFSoftShadowsK) * attenuation;
+    float ao     = u_AO ? ambient_occlusion(FS_IN_WorldPos, FS_IN_Normal, u_AONumSteps, u_AOStepSize) : 1.0f;
+
+    FS_OUT_Color = albedo * clamp(dot(N, L), 0.0, 1.0) * shadow + albedo * u_AOStrength * ao;
 }
 
 // ------------------------------------------------------------------

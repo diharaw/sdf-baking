@@ -25,7 +25,6 @@ layout(std140, binding = 0) uniform GlobalUniforms
 {
     mat4 view_proj;
     vec4 cam_pos;
-    vec4 light_direction;
     int  num_instances;
 };
 
