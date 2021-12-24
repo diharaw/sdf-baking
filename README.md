@@ -7,6 +7,23 @@ An OpenGL sample that demonstrates baking Signed Distance Fields (SDF) into 3D t
 ![SDFBaking](data/screenshot_1.jpg)
 ![SDFBaking](data/screenshot_2.jpg)
 
+## Building
+
+### Windows
+Tested on: Windows 10 version 21H1
+
+Prerequisites
+* MSVC 19.00 or higher
+* CMake 3.8 or higher
+
+```
+git clone --recursive https://github.com/diharaw/SDFBaking.git
+cd SDFBaking
+mkdir build
+cd build
+cmake -G "Visual Studio 16 2019" ..
+```
+
 ## Dependencies
 * [dwSampleFramework](https://github.com/diharaw/dwSampleFramework) 
 
