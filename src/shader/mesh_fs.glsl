@@ -29,8 +29,11 @@ in vec4 FS_IN_NDCFragPos;
 
 struct Instance
 {
-    mat4  transform;
+    mat4  inverse_transform;
     vec4  half_extents;
+    vec4  os_center;
+    vec4  ws_center;
+    vec4  ws_axis[3];
     ivec4 sdf_idx;
 };
 
@@ -56,6 +59,7 @@ layout(std140, binding = 2) uniform SDFTextures
     sampler3D sdf[NUM_SDFS];
 };
 
+uniform vec3  u_Color;
 uniform bool  u_SDFSoftShadows;
 uniform float u_SDFTMin;
 uniform float u_SDFTMax;
@@ -65,46 +69,115 @@ uniform float u_SDFSoftShadowsK;
 // FUNCTIONS --------------------------------------------------------
 // ------------------------------------------------------------------
 
-vec3 invert(vec3 p, mat4 t)
+vec3 transform_point(vec3 ws_p, mat4 t)
 {
-    return vec3(inverse(t) * vec4(p, 1.0f));
+    return vec3(t * vec4(ws_p, 1.0f));
 }
 
 // ------------------------------------------------------------------
 
-float evaluate_box_sdf(vec3 p, vec3 b)
+float sample_sdf(in vec3 os_p, in Instance instance)
 {
-    vec3 q = abs(p) - b;
-    return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
+    vec3 remapped_p = os_p - (instance.os_center.xyz - instance.half_extents.xyz);
+    vec3 box_size = instance.half_extents.xyz * 2.0f;
+
+    vec3 uvw = (remapped_p / box_size);
+    return textureLod(sdf[instance.sdf_idx.x], uvw, 0.0f).r;
 }
 
 // ------------------------------------------------------------------
 
-float evaluate_scene_sdf(vec3 p, out vec3 sample_pos, out Instance instance)
+bool inside_obb(in vec3 os_p, in Instance instance)
+{
+    vec3 min_extents = instance.os_center.xyz - instance.half_extents.xyz;
+    vec3 max_extents = instance.os_center.xyz + instance.half_extents.xyz;
+
+    return all(greaterThanEqual(os_p, min_extents)) && all(lessThanEqual(os_p, max_extents));
+}
+
+// ------------------------------------------------------------------
+
+vec3 calculate_normal(in vec3 os_p, in Instance instance)
+{
+    const float eps = 0.0001f; 
+    const vec2 h = vec2(eps, 0.0f);
+    return normalize( vec3(sample_sdf(os_p + h.xyy, instance) - sample_sdf(os_p - h.xyy, instance),
+                           sample_sdf(os_p + h.yxy, instance) - sample_sdf(os_p - h.yxy, instance),
+                           sample_sdf(os_p + h.yyx, instance) - sample_sdf(os_p - h.yyx, instance) ) );
+}
+
+// ------------------------------------------------------------------
+
+vec3 find_closest_point_on_obb(in vec3 ws_p, in Instance instance)
+{
+    vec3 c = instance.ws_center.xyz;
+    
+    vec3 d = ws_p - c;
+    vec3 q = c;
+    
+    for (int i = 0; i < 3; i++)
+    {
+        float dist = dot(d, instance.ws_axis[i].xyz);
+        
+        if (dist > instance.half_extents[i]) dist = instance.half_extents[i];
+        if (dist < -instance.half_extents[i]) dist = -instance.half_extents[i];
+        
+        q += dist * instance.ws_axis[i].xyz;
+    }
+    
+    return q;
+}
+
+// ------------------------------------------------------------------
+
+vec3 find_closest_point_on_mesh(in vec3 ws_p, in Instance instance)
+{
+    vec3 os_p = transform_point(ws_p, instance.inverse_transform);
+
+    float t = sample_sdf(os_p, instance);
+
+    return ws_p - calculate_normal(os_p, instance) * t;
+}
+
+// ------------------------------------------------------------------
+
+float evaluate_mesh_sdf(in vec3 ws_p, in Instance instance)
+{
+    vec3 os_p = transform_point(ws_p, instance.inverse_transform);
+
+    if (inside_obb(os_p, instance))
+        return sample_sdf(os_p, instance);
+    else 
+    {
+#if defined(USE_ACCURATE_DISTANCE)        
+        vec3 point_on_volume = find_closest_point_on_obb(ws_p, instance);
+        vec3 point_on_mesh = find_closest_point_on_mesh(point_on_volume, instance);
+    
+        float h = length(point_on_mesh - ws_p);
+
+        return h;
+#else
+        vec3 point_on_volume = find_closest_point_on_obb(ws_p, instance);
+        return length(point_on_volume - ws_p) + sample_sdf(transform_point(point_on_volume, instance.inverse_transform), instance);
+#endif
+    }
+}
+
+// ------------------------------------------------------------------
+
+float evaluate_scene_sdf(vec3 ws_p)
 {
     float dist_to_box = INFINITY;
 
     for (int i = 0; i < num_instances; i++)
     {
-        sample_pos = invert(p, instances[i].transform);
-        float t    = evaluate_box_sdf(sample_pos, instances[i].half_extents.xyz);
+        float h = evaluate_mesh_sdf(ws_p, instances[i]);
 
-        if (t < dist_to_box)
-        {
-            dist_to_box = t;
-            instance    = instances[i];
-        }
+        if (h < dist_to_box)
+            dist_to_box = h;
     }
 
     return dist_to_box;
-}
-
-// ------------------------------------------------------------------
-
-float evaluate_mesh_sdf(vec3 p, in Instance instance)
-{
-    vec3 uvw = (p / instance.half_extents.xyz) * 0.5f + vec3(0.5f);
-    return textureLod(sdf[instance.sdf_idx.x], uvw, 0.0f).r;
 }
 
 // ------------------------------------------------------------------
@@ -115,13 +188,9 @@ float shadow_ray_march(vec3 ro, vec3 rd, float k)
 
     for (float t = u_SDFTMin; t < u_SDFTMax;)
     {
-        vec3     sample_pos;
-        Instance instance;
+        vec3 p = ro + rd * t;
 
-        float dist_to_box  = evaluate_scene_sdf(ro + rd * t, sample_pos, instance);
-        float dist_to_mesh = evaluate_mesh_sdf(sample_pos, instance);
-
-        float h = max(dist_to_box, 0.0f) + dist_to_mesh;
+        float h = evaluate_scene_sdf(p);
 
         if (h < 0.001f)
             return 0.0f;
@@ -141,7 +210,7 @@ float shadow_ray_march(vec3 ro, vec3 rd, float k)
 
 void main()
 {
-    vec3 albedo = vec3(0.5f);
+    vec3 albedo = u_Color;
     vec3 L      = -light_direction.xyz;
     vec3 N      = normalize(FS_IN_Normal);
 

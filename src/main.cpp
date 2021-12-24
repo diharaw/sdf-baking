@@ -31,9 +31,15 @@ struct GlobalUniforms
 struct InstanceUniforms
 {
     DW_ALIGNED(16)
-    glm::mat4 transform;
+    glm::mat4 inverse_transform;
     DW_ALIGNED(16)
     glm::vec4 half_extents;
+    DW_ALIGNED(16)
+    glm::vec4      os_center;
+    DW_ALIGNED(16)
+    glm::vec4      ws_center;
+    DW_ALIGNED(16)
+    glm::vec4      ws_axis[3];
     DW_ALIGNED(16)
     glm::ivec4 sdf_idx;
 };
@@ -42,6 +48,7 @@ struct Instance
 {
     // Mesh
     dw::Mesh::Ptr mesh;
+    glm::vec3     color;
 
     // SDF
     dw::gl::Texture3D::Ptr sdf;
@@ -52,6 +59,8 @@ struct Instance
     glm::vec3              max_extents;
 
     // Transform
+    bool      animate   = false;
+    float     rotation  = 0.0f;
     glm::vec3 position  = glm::vec3(0.0f);
     glm::mat4 transform = glm::mat4(1.0f);
 };
@@ -127,6 +136,9 @@ protected:
             ImGui::PushID(i);
             ImGui::Text("Mesh %i", i);
             ImGui::InputFloat3("Position", &instance.position.x);
+            ImGui::SliderFloat("Rotation", &instance.rotation, -180.0f, 180.0f);
+            ImGui::ColorEdit3("Color", &instance.color.x);
+            ImGui::Checkbox("Animate", &instance.animate);
             ImGui::Separator();
             ImGui::PopID();
         }
@@ -315,11 +327,14 @@ private:
 
     // -----------------------------------------------------------------------------------------------------------------------------------
 
-    bool load_mesh(const std::string& name)
+    bool load_mesh(const std::string& name, glm::vec3 position, float rotation, glm::vec3 color)
     {
         Instance instance;
 
         instance.mesh = dw::Mesh::load("mesh/" + name + ".obj");
+        instance.color    = color;
+        instance.position = position;
+        instance.rotation = rotation;
 
         if (!instance.mesh)
         {
@@ -333,8 +348,8 @@ private:
 
         InstanceUniforms uniform;
 
-        uniform.transform    = instance.transform;
         uniform.half_extents = glm::vec4((instance.max_extents - instance.min_extents) / 2.0f, 0.0f);
+        uniform.os_center    = glm::vec4((instance.max_extents + instance.min_extents) / 2.0f, 1.0f);
         uniform.sdf_idx      = glm::ivec4(m_texture_uniforms.size(), 0, 0, 0);
 
         m_instance_uniforms.push_back(uniform);
@@ -348,14 +363,30 @@ private:
     bool load_scene()
     {
         std::string meshes[] = {
-            "bunny"
+            "bunny",
+            "sphere"
         };
 
-        for (auto mesh : meshes)
+        glm::vec3 positions[] = {
+            glm::vec3(-2.0f, 0.0f, 5.0f),
+            glm::vec3(2.0f, 0.0f, 5.0f)
+        };
+
+        float rotations[] = {
+            45.0f,
+            0.0f
+        };
+
+        glm::vec3 colors[] = {
+            glm::vec3(0.569844782f, 0.157939225f, 0.157963991f),
+            glm::vec3(0.334582895f, 0.503325939f, 0.222088382f)
+        };
+
+        for (int i = 0; i < 2; i++)
         {
-            if (!load_mesh(mesh))
+            if (!load_mesh(meshes[i], positions[i], rotations[i], colors[i]))
             {
-                DW_LOG_FATAL("Failed to create mesh instance: " + mesh);
+                DW_LOG_FATAL("Failed to create mesh instance: " + meshes[i]);
                 return false;
             }
         }
@@ -384,6 +415,7 @@ private:
 
     void render_mesh(dw::Mesh::Ptr mesh, glm::mat4 model, glm::vec3 color)
     {
+        m_mesh_program->set_uniform("u_Color", color);
         m_mesh_program->set_uniform("u_Model", model);
 
         // Bind vertex array.
@@ -434,7 +466,7 @@ private:
         render_mesh(m_ground, glm::mat4(1.0f), glm::vec3(0.5f));
 
         for (const auto& instance : m_instances)
-            render_mesh(instance.mesh, instance.transform, glm::vec3(0.5f));
+            render_mesh(instance.mesh, instance.transform, instance.color);
     }
 
     // -----------------------------------------------------------------------------------------------------------------------------------
@@ -483,9 +515,26 @@ private:
 
         for (int i = 0; i < m_instances.size(); i++)
         {
-            auto& instance                   = m_instances[i];
+            auto& instance                           = m_instances[i];
+
             instance.transform               = glm::translate(glm::mat4(1.0f), instance.position);
-            m_instance_uniforms[i].transform = instance.transform;
+
+            if (instance.animate)
+                instance.transform = instance.transform * glm::rotate(glm::mat4(1.0f), glm::radians(float(glfwGetTime()) * 10.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+            else 
+                instance.transform = instance.transform * glm::rotate(glm::mat4(1.0f), glm::radians(instance.rotation), glm::vec3(0.0f, 1.0f, 0.0f));
+
+            m_instance_uniforms[i].inverse_transform = glm::inverse(instance.transform);
+            m_instance_uniforms[i].ws_center = instance.transform * m_instance_uniforms[i].os_center;
+            
+            glm::vec3 axis[] = {
+                glm::vec3(1.0f, 0.0f, 0.0f),
+                glm::vec3(0.0f, 1.0f, 0.0f),
+                glm::vec3(0.0f, 0.0f, 1.0f)
+            };
+
+            for (int j = 0; j < 3; j++)
+                m_instance_uniforms[i].ws_axis[j] = glm::vec4(glm::mat3(instance.transform) * axis[j], 0.0f);
         }
     }
 
@@ -559,7 +608,7 @@ private:
     float m_light_pitch = -0.4f;
 
     // SDF
-    float m_t_min               = 0.05f;
+    float m_t_min               = 0.2f;
     float m_t_max               = 100.0f;
     bool  m_soft_shadows        = true;
     float m_soft_shadows_k      = 4.0f;
