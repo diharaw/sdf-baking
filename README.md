@@ -4,7 +4,6 @@
 An OpenGL sample that demonstrates baking Signed Distance Fields (SDF) into 3D textures using compute shaders and using them to add Soft Shadows and Ambient Occlusion to a rasterized scene.
 
 ## Screenshots
-
 ![SDFBaking](data/screenshot_1.jpg)
 ![SDFBaking](data/screenshot_2.jpg)
 
