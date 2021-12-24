@@ -1,7 +1,7 @@
 [![License: MIT](https://img.shields.io/packagist/l/doctrine/orm.svg)](https://opensource.org/licenses/MIT)
 
 # SDF Baking
-An OpenGL demo that demonstrates baking Signed Distance Fields (SDF) into 3D textures using compute shaders and using them to add Soft Shadows and Ambient Occlusion to a rasterized scene.
+An OpenGL sample that demonstrates baking Signed Distance Fields (SDF) into 3D textures using compute shaders and using them to add Soft Shadows and Ambient Occlusion to a rasterized scene.
 
 ## Screenshots
 
